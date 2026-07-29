@@ -29,7 +29,7 @@ class GoogleFormsServer {
     this.server = new Server(
       {
         name: 'google-forms-mcp',
-        version: '0.1.0',
+        version: '0.2.0',
       },
       {
         capabilities: {
@@ -86,7 +86,7 @@ class GoogleFormsServer {
         },
         {
           name: 'add_text_question',
-          description: 'Add a text question to the form',
+          description: 'Add a text question to the form (appended at the end)',
           inputSchema: {
             type: 'object',
             properties: {
@@ -108,7 +108,7 @@ class GoogleFormsServer {
         },
         {
           name: 'add_multiple_choice_question',
-          description: 'Add a multiple choice question to the form',
+          description: 'Add a multiple choice question to the form (appended at the end)',
           inputSchema: {
             type: 'object',
             properties: {
@@ -162,6 +162,42 @@ class GoogleFormsServer {
             },
             required: ['formId'],
           },
+        },
+        {
+          name: 'reverse_form_items',
+          description: 'Reverse the order of all items (questions) in a form. Useful for fixing forms whose items were inserted in reverse order.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              formId: {
+                type: 'string',
+                description: 'Form ID',
+              }
+            },
+            required: ['formId'],
+          },
+        },
+        {
+          name: 'move_item',
+          description: 'Move a single item to a new position in the form (0-indexed).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              formId: {
+                type: 'string',
+                description: 'Form ID',
+              },
+              fromIndex: {
+                type: 'number',
+                description: 'Current 0-indexed position of the item',
+              },
+              toIndex: {
+                type: 'number',
+                description: 'Target 0-indexed position of the item',
+              }
+            },
+            required: ['formId', 'fromIndex', 'toIndex'],
+          },
         }
       ],
     }));
@@ -179,6 +215,10 @@ class GoogleFormsServer {
             return await this.getForm(request.params.arguments);
           case 'get_form_responses':
             return await this.getFormResponses(request.params.arguments);
+          case 'reverse_form_items':
+            return await this.reverseFormItems(request.params.arguments);
+          case 'move_item':
+            return await this.moveItem(request.params.arguments);
           default:
             throw new McpError(
               ErrorCode.MethodNotFound,
@@ -198,6 +238,13 @@ class GoogleFormsServer {
         };
       }
     });
+  }
+
+  // Helper: get the current item count of a form (so new items can be appended)
+  private async getFormItemCount(formId: string): Promise<number> {
+    const form = await this.forms.forms.get({ formId });
+    const items = (form.data && form.data.items) || [];
+    return items.length;
   }
 
   private async createForm(args: any) {
@@ -255,12 +302,10 @@ class GoogleFormsServer {
     }
 
     try {
-      // Get the current form
-      const form = await this.forms.forms.get({
-        formId: args.formId,
-      });
+      // Fetch current item count so we can append at the end
+      const itemCount = await this.getFormItemCount(args.formId);
 
-      // Create a request to add a new question
+      // Create a request to add a new question at the end
       const updateRequest = {
         requests: [
           {
@@ -275,7 +320,7 @@ class GoogleFormsServer {
                 }
               },
               location: {
-                index: 0
+                index: itemCount
               }
             }
           }
@@ -283,7 +328,7 @@ class GoogleFormsServer {
       };
 
       // Update the form
-      const response = await this.forms.forms.batchUpdate({
+      await this.forms.forms.batchUpdate({
         formId: args.formId,
         requestBody: updateRequest,
       });
@@ -297,6 +342,7 @@ class GoogleFormsServer {
               message: 'Text question added successfully',
               questionTitle: args.questionTitle,
               required: args.required || false,
+              insertedAtIndex: itemCount,
             }, null, 2),
           },
         ],
@@ -324,7 +370,10 @@ class GoogleFormsServer {
         value: option
       }));
 
-      // Create a request to add a new question
+      // Fetch current item count so we can append at the end
+      const itemCount = await this.getFormItemCount(args.formId);
+
+      // Create a request to add a new question at the end
       const updateRequest = {
         requests: [
           {
@@ -342,7 +391,7 @@ class GoogleFormsServer {
                 }
               },
               location: {
-                index: 0
+                index: itemCount
               }
             }
           }
@@ -350,7 +399,7 @@ class GoogleFormsServer {
       };
 
       // Update the form
-      const response = await this.forms.forms.batchUpdate({
+      await this.forms.forms.batchUpdate({
         formId: args.formId,
         requestBody: updateRequest,
       });
@@ -365,6 +414,7 @@ class GoogleFormsServer {
               questionTitle: args.questionTitle,
               options: args.options,
               required: args.required || false,
+              insertedAtIndex: itemCount,
             }, null, 2),
           },
         ],
@@ -428,6 +478,118 @@ class GoogleFormsServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get form responses: ${error.message}`
+      );
+    }
+  }
+
+  // Reverse the order of every item in a form using a batch of moveItem requests.
+  // Strategy: repeatedly pop the item at the bottom (index N-1) and insert it at the
+  // current front. Google Forms API applies requests in order, so after N-1 moves the
+  // list is fully reversed. Works in a single batchUpdate call.
+  private async reverseFormItems(args: any) {
+    if (!args.formId) {
+      throw new McpError(ErrorCode.InvalidParams, 'Form ID is required');
+    }
+
+    try {
+      const form = await this.forms.forms.get({ formId: args.formId });
+      const items = (form.data && form.data.items) || [];
+      const n = items.length;
+
+      if (n < 2) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                success: true,
+                message: 'Form has fewer than 2 items; nothing to reverse.',
+                itemCount: n,
+              }, null, 2),
+            },
+          ],
+        };
+      }
+
+      const requests: any[] = [];
+      for (let i = 0; i < n - 1; i++) {
+        requests.push({
+          moveItem: {
+            originalLocation: { index: n - 1 },
+            newLocation: { index: i },
+          }
+        });
+      }
+
+      await this.forms.forms.batchUpdate({
+        formId: args.formId,
+        requestBody: { requests },
+      });
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              message: `Reversed ${n} items successfully.`,
+              itemCount: n,
+              moveRequests: requests.length,
+            }, null, 2),
+          },
+        ],
+      };
+    } catch (error: any) {
+      console.error('Error reversing form items:', error);
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to reverse form items: ${error.message}`
+      );
+    }
+  }
+
+  // Move a single item to a new position.
+  private async moveItem(args: any) {
+    if (!args.formId || typeof args.fromIndex !== 'number' || typeof args.toIndex !== 'number') {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'formId, fromIndex (number), and toIndex (number) are required'
+      );
+    }
+
+    try {
+      await this.forms.forms.batchUpdate({
+        formId: args.formId,
+        requestBody: {
+          requests: [
+            {
+              moveItem: {
+                originalLocation: { index: args.fromIndex },
+                newLocation: { index: args.toIndex },
+              }
+            }
+          ]
+        }
+      });
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              message: `Moved item from index ${args.fromIndex} to index ${args.toIndex}.`,
+              fromIndex: args.fromIndex,
+              toIndex: args.toIndex,
+            }, null, 2),
+          },
+        ],
+      };
+    } catch (error: any) {
+      console.error('Error moving item:', error);
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to move item: ${error.message}`
       );
     }
   }
